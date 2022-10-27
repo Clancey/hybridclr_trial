@@ -4,6 +4,8 @@ using System.Collections;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Reflection;
+using System.Threading.Tasks;
 using UnityEngine;
 using UnityEngine.Networking;
 
@@ -23,15 +25,10 @@ public class LoadDll : MonoBehaviour
         StartCoroutine(DownLoadAssets(this.StartGame));
     }
 
-    private static Dictionary<string, byte[]> s_assetDatas = new Dictionary<string, byte[]>();
+  private static Dictionary<string, AssetBundle> assetBundles = new Dictionary<string, AssetBundle>();
+  private static Dictionary<string, byte[]> s_assetDatas = new Dictionary<string, byte[]>();
 
-    public static byte[] GetAssetData(string dllName)
-    {
-        return s_assetDatas[dllName];
-    }
-
-    private string GetWebRequestPath(string asset)
-    {
+  static string GetWebRequestPath(string asset) {
         var path = $"{Application.streamingAssetsPath}/{asset}";
         if (!path.Contains("://"))
         {
@@ -44,11 +41,69 @@ public class LoadDll : MonoBehaviour
         return path;
     }
 
-    IEnumerator DownLoadAssets(Action onDownloadComplete)
+  static async Task<byte[]> GetStreamingAsset(string bundleName, string name) {
+    var bundle = await GetStreamingAssetBundle(bundleName);
+    var fileData = bundle.LoadAsset<TextAsset>(name);
+    return fileData.bytes;
+
+  }
+  public static async Task<AssetBundle> GetStreamingAssetBundle(string bundleName) {
+    if (assetBundles.ContainsKey(bundleName))
+      return assetBundles[bundleName];
+    var data = await GetStreamingAssetData(bundleName);
+    return assetBundles[bundleName] = AssetBundle.LoadFromMemory(data);
+  }
+    static async Task<byte[]> GetStreamingAssetData(string bundleName) {
+    if (s_assetDatas.ContainsKey(bundleName))
+      return s_assetDatas[bundleName];
+    //Lets ditch this so it doesn't use unity's http stack...
+    string dllPath = GetWebRequestPath(bundleName);
+    Debug.Log($"start download ab:{bundleName} 1");
+    UnityWebRequest www = UnityWebRequest.Get(dllPath);
+
+    var tcs = new TaskCompletionSource<bool>();
+    var request = www.SendWebRequest();
+    void onComplete(AsyncOperation operation) => tcs.TrySetResult(true);
+    request.completed += onComplete;
+    await tcs.Task;
+    request.completed -= onComplete;
+#if UNITY_2020_1_OR_NEWER
+    if (www.result != UnityWebRequest.Result.Success) {
+      Debug.Log(www.error);
+      return null;
+    }
+#else
+    if (www.isHttpError || www.isNetworkError)
+    {
+      Debug.Log(www.error);
+      return null;
+    }
+#endif
+    else {
+      // Or retrieve results as binary data
+      byte[] abBytes = www.downloadHandler.data;
+      Debug.Log($"dll:{bundleName}  size:{abBytes.Length}");
+      return s_assetDatas[bundleName] = abBytes;
+    }
+  }
+
+  static async Task<Assembly> GetAssembly(string name) {
+
+    var data = await GetStreamingAssetData(name);
+#if !UNITY_EDITOR
+      return System.Reflection.Assembly.Load(data);
+#else
+    var n = Path.GetFileNameWithoutExtension(name);
+    return AppDomain.CurrentDomain.GetAssemblies().First(assembly => assembly.GetName().Name == n);
+#endif
+  }
+
+
+  IEnumerator DownLoadAssets(Action onDownloadComplete)
     {
         var assets = new List<string>
         {
-            "prefabs",
+           // "prefabs",
             "Assembly-CSharp.dll",
         }.Concat(AOTMetaAssemblyNames);
 
@@ -76,6 +131,7 @@ public class LoadDll : MonoBehaviour
                 byte[] assetData = www.downloadHandler.data;
                 Debug.Log($"dll:{asset}  size:{assetData.Length}");
                 s_assetDatas[asset] = assetData;
+               // assetBundles[asset] = AssetBundle.LoadFromMemory(assetData);
             }
         }
 
@@ -83,41 +139,45 @@ public class LoadDll : MonoBehaviour
     }
 
 
-    void StartGame()
+    async void StartGame()
     {
-        LoadMetadataForAOTAssemblies();
+        Debug.Log("Start Game Called");
+        await LoadMetadataForAOTAssemblies();
+        Debug.Log("Loading ASsembly: Assembly-CSharp");
+        var gameAss = await GetAssembly("Assembly-CSharp.dll");
 
-#if !UNITY_EDITOR
-        var gameAss = System.Reflection.Assembly.Load(GetAssetData("Assembly-CSharp.dll"));
-#else
-        var gameAss = AppDomain.CurrentDomain.GetAssemblies().First(assembly => assembly.GetName().Name == "Assembly-CSharp");
-#endif
-
-        AssetBundle prefabAb = AssetBundle.LoadFromMemory(GetAssetData("prefabs"));
-        GameObject testPrefab = Instantiate(prefabAb.LoadAsset<GameObject>("HotUpdatePrefab.prefab"));
-    }
-
+        var appType = gameAss.GetType("AppLoader");
+        Debug.Log($"AppLoader Loaded: {appType != null}");
+        var mainMethod = appType.GetMethod("Init");
+        Debug.Log($"Init Method Loaded: {mainMethod != null}");
+        mainMethod.Invoke(null, null);
+  }
 
 
     /// <summary>
-    /// 为aot assembly加载原始metadata， 这个代码放aot或者热更新都行。
-    /// 一旦加载后，如果AOT泛型函数对应native实现不存在，则自动替换为解释模式执行
+    /// 脦陋aot assembly录脫脭脴脭颅脢录metadata拢卢 脮芒赂枚麓煤脗毛路脜aot禄貌脮脽脠脠赂眉脨脗露录脨脨隆拢
+    /// 脪禄碌漏录脫脭脴潞贸拢卢脠莽鹿没AOT路潞脨脥潞炉脢媒露脭脫娄native脢碌脧脰虏禄麓忙脭脷拢卢脭貌脳脭露炉脤忙禄禄脦陋陆芒脢脥脛拢脢陆脰麓脨脨
     /// </summary>
-    private static void LoadMetadataForAOTAssemblies()
+    private static async Task LoadMetadataForAOTAssemblies()
     {
-        // 可以加载任意aot assembly的对应的dll。但要求dll必须与unity build过程中生成的裁剪后的dll一致，而不能直接使用原始dll。
-        // 我们在BuildProcessors里添加了处理代码，这些裁剪后的dll在打包时自动被复制到 {项目目录}/HybridCLRData/AssembliesPostIl2CppStrip/{Target} 目录。
+        // 驴脡脪脭录脫脭脴脠脦脪芒aot assembly碌脛露脭脫娄碌脛dll隆拢碌芦脪陋脟贸dll卤脴脨毛脫毛unity build鹿媒鲁脤脰脨脡煤鲁脡碌脛虏脙录么潞贸碌脛dll脪禄脰脗拢卢露酶虏禄脛脺脰卤陆脫脢鹿脫脙脭颅脢录dll隆拢
+        // 脦脪脙脟脭脷BuildProcessors脌茂脤铆录脫脕脣麓娄脌铆麓煤脗毛拢卢脮芒脨漏虏脙录么潞贸碌脛dll脭脷麓貌掳眉脢卤脳脭露炉卤禄赂麓脰脝碌陆 {脧卯脛驴脛驴脗录}/HybridCLRData/AssembliesPostIl2CppStrip/{Target} 脛驴脗录隆拢
 
-        /// 注意，补充元数据是给AOT dll补充元数据，而不是给热更新dll补充元数据。
-        /// 热更新dll不缺元数据，不需要补充，如果调用LoadMetadataForAOTAssembly会返回错误
+        /// 脳垄脪芒拢卢虏鹿鲁盲脭陋脢媒戮脻脢脟赂酶AOT dll虏鹿鲁盲脭陋脢媒戮脻拢卢露酶虏禄脢脟赂酶脠脠赂眉脨脗dll虏鹿鲁盲脭陋脢媒戮脻隆拢
+        /// 脠脠赂眉脨脗dll虏禄脠卤脭陋脢媒戮脻拢卢虏禄脨猫脪陋虏鹿鲁盲拢卢脠莽鹿没碌梅脫脙LoadMetadataForAOTAssembly禄谩路碌禄脴麓铆脦贸
         /// 
-        HomologousImageMode mode = HomologousImageMode.SuperSet;
         foreach (var aotDllName in AOTMetaAssemblyNames)
         {
-            byte[] dllBytes = GetAssetData(aotDllName);
-            // 加载assembly对应的dll，会自动为它hook。一旦aot泛型函数的native函数不存在，用解释器版本代码
-            LoadImageErrorCode err = RuntimeApi.LoadMetadataForAOTAssembly(dllBytes, mode);
-            Debug.Log($"LoadMetadataForAOTAssembly:{aotDllName}. mode:{mode} ret:{err}");
+      try {
+                HomologousImageMode mode = HomologousImageMode.SuperSet;
+                byte[] dllBytes = await GetStreamingAssetData(aotDllName);
+        // 录脫脭脴assembly露脭脫娄碌脛dll拢卢禄谩脳脭露炉脦陋脣眉hook隆拢脪禄碌漏aot路潞脨脥潞炉脢媒碌脛native潞炉脢媒虏禄麓忙脭脷拢卢脫脙陆芒脢脥脝梅掳忙卤戮麓煤脗毛
+        LoadImageErrorCode err = RuntimeApi.LoadMetadataForAOTAssembly(dllBytes, mode);
+        Debug.Log($"LoadMetadataForAOTAssembly:{aotDllName}. ret:{err}");
+      }
+      catch {
+        //Debug.Log(e);
+      }
         }
     }
 }
